@@ -627,6 +627,70 @@ def _infer_user_voice_channel(adapter, user_id: str) -> Optional[tuple]:
     return None
 
 
+async def _on_voice_text_message(message: Any) -> None:
+    """Forward a message typed in the voice channel's built-in text chat to the live session.
+
+    Installed on the Discord client via ``add_listener`` (public discord.py API), so the
+    hermes-agent adapter is untouched. Only the bridge's target user, in the exact voice
+    channel, counts — everything else is ignored.
+    """
+    try:
+        author = getattr(message, "author", None)
+        if author is None or getattr(author, "bot", False):
+            return
+        guild = getattr(message, "guild", None)
+        if guild is None:
+            return
+        info = _active_bridges.get(guild.id)
+        if not info:
+            return
+        vc_channel = getattr(info.get("vc"), "channel", None)
+        if vc_channel is None or getattr(message.channel, "id", None) != vc_channel.id:
+            return
+        target_user = str(info.get("user_id") or "")
+        if target_user and str(getattr(author, "id", "")) != target_user:
+            logger.debug("VoiceLive: ignoring text-chat message from non-target user %s", author.id)
+            return
+        content = (getattr(message, "content", "") or "").strip()
+        if not content:
+            return
+        bridge = getattr(_bridge_mod, "BRIDGE", None) if _bridge_mod is not None else None
+        gemini = getattr(bridge, "_gemini", None) if bridge is not None else None
+        if gemini is None or not hasattr(gemini, "send_text") or not getattr(bridge, "_running", False):
+            return
+        await gemini.send_text(content)
+        logger.info(
+            "VoiceLive: text-chat message forwarded to Gemini (from=%s, chars=%d)",
+            getattr(author, "display_name", "?"), len(content),
+        )
+    except Exception:
+        logger.debug("VoiceLive: text-chat forward failed", exc_info=True)
+
+
+def _install_voice_text_listener(client: Any) -> None:
+    """Attach the voice-text-chat listener to the Discord client (idempotent per module load).
+
+    On plugin reload the previous module's listener is removed first, so reloads never
+    stack duplicate callbacks pointing at dead module state.
+    """
+    if client is None:
+        return
+    old = getattr(client, "_voicelive_text_listener_ref", None)
+    if old is not None and old is not _on_voice_text_message:
+        try:
+            client.remove_listener(old, "on_message")
+        except Exception:
+            pass
+    if getattr(client, "_voicelive_text_listener_ref", None) is _on_voice_text_message:
+        return
+    try:
+        client.add_listener(_on_voice_text_message, "on_message")
+        client._voicelive_text_listener_ref = _on_voice_text_message
+        logger.info("VoiceLive: text-chat listener installed on Discord client")
+    except Exception:
+        logger.warning("VoiceLive: could not install text-chat listener", exc_info=True)
+
+
 async def _autostart_voice_live() -> None:
     """Spawn the bridge for the autostart request, then exit.
 
@@ -900,6 +964,7 @@ async def voice_live(adapter, guild_id: str, channel_id: str, user_id: Optional[
             "user_profile": user_profile,
             "user_id": effective_user_id,
         }
+        _install_voice_text_listener(getattr(adapter, "_client", None))
 
         try:
             ready = await asyncio.wait_for(ready_future, timeout=120.0)
