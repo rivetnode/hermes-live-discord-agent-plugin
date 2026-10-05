@@ -75,6 +75,50 @@ GEMINI_MODEL_FALLBACKS = [
 ]
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "") or os.getenv("GOOGLE_API_KEY", "")
 GEMINI_VOICE_NAME = os.getenv("DISCORD_VOICE_LIVE_VOICE", "Kore")
+
+# ── cross-channel-voice-settings (5-oct-2026): store compartido ───────────
+# El ajuste único de Eko (voz + modelo, escrito con /voz en cualquier canal
+# o desde el panel) manda sobre el perfil/env al arrancar una sesión. La
+# lectura va por el control plane de Eko (CLI — el mismo camino probado de
+# /conv y /voz). Fail-open: sin store → perfil/env de siempre.
+
+_EKO_LIVEKIT_DIR = "/home/admin/eko-livekit"
+
+
+def _read_store_voice_settings(user_id: str) -> Tuple[Optional[str], Optional[str]]:
+    """(voz, modelo) del store de Eko para este usuario. (None, None) si falla."""
+    py = os.path.join(_EKO_LIVEKIT_DIR, ".venv", "bin", "python")
+    if not os.path.exists(py):
+        py = sys.executable
+    try:
+        proc = subprocess.run(
+            [
+                py, "-m", "eko.hub.commands",
+                "--endpoint-id", f"discord:store:{user_id or 'default'}",
+                "--tenant-id", "t1",
+                "--channel", "discord",
+                "--user-id", user_id or "",
+            ],
+            input=json.dumps(
+                {"text": "/voz", "tenant_id": "t1", "channel": "discord", "user_id": user_id or ""}
+            ),
+            capture_output=True,
+            text=True,
+            timeout=12,
+            cwd=_EKO_LIVEKIT_DIR,
+            env={**os.environ, "PYTHONPATH": _EKO_LIVEKIT_DIR},
+        )
+        if proc.returncode != 0:
+            logger.warning(
+                "discord-voice: store voice rc=%s stderr=%s", proc.returncode, proc.stderr[:160]
+            )
+            return None, None
+        data = json.loads(proc.stdout.strip())
+        if data.get("ok"):
+            return data.get("voice"), data.get("voice_model")
+    except Exception as exc:  # noqa: BLE001 — fail-open deliberado
+        logger.warning("discord-voice: store voice read failed: %s", exc)
+    return None, None
 INITIAL_GREETING = os.getenv(
     "DISCORD_VOICE_LIVE_GREETING",
     "I'm here.",
@@ -4227,6 +4271,11 @@ class GeminiLiveBridge:
             or os.getenv("DISCORD_VOICE_LIVE_VOICE", GEMINI_VOICE_NAME)
             or GEMINI_VOICE_NAME
         )
+        # cross-channel-voice-settings (5-oct): el store se lee UNA vez en el
+        # primer connect() (async, sin bloquear el loop); si trae valor, manda
+        # sobre el perfil. Cache por sesión (reconnects no releen).
+        self._store_checked = False
+        self._store_model: Optional[str] = None
         self._send_q: "queue.Queue[Optional[bytes]]" = queue.Queue(maxsize=256)
         self._video_q: "queue.Queue[Optional[Dict[str, Any]]]" = queue.Queue(maxsize=2)
         self._tasks: List[asyncio.Task] = []
@@ -4359,7 +4408,28 @@ class GeminiLiveBridge:
     async def connect(self):
         import websockets
         ws_url = f"{GEMINI_WS_URL}?key={GEMINI_API_KEY}"
-        candidates = [GEMINI_MODEL]
+        # cross-channel-voice-settings (5-oct): primer connect de la sesión —
+        # lee el ajuste único del store (voz+modelo) sin bloquear el loop.
+        if not self._store_checked:
+            self._store_checked = True
+            _uid = getattr(self._user_profile, "discord_id", None) or os.getenv(
+                "DISCORD_VOICE_LIVE_USER_ID", ""
+            )
+            try:
+                _st_voice, _st_model = await asyncio.to_thread(
+                    _read_store_voice_settings, str(_uid or "")
+                )
+            except Exception:  # noqa: BLE001 — fail-open
+                _st_voice, _st_model = None, None
+            if _st_voice:
+                self._voice_name = _st_voice
+            if _st_model:
+                self._store_model = _st_model
+        candidates = []
+        if self._store_model:
+            candidates.append(self._store_model)
+        if GEMINI_MODEL not in candidates:
+            candidates.append(GEMINI_MODEL)
         for model in GEMINI_MODEL_FALLBACKS:
             if model not in candidates:
                 candidates.append(model)
