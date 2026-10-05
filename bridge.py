@@ -4038,6 +4038,94 @@ except Exception:
 
 
 if voice_recv is not None:
+    # ── HERMES PATCH (2026-10-05): DAVE receive hardening ──────────────────
+    # Discord voice is E2EE (DAVE): inbound frames are MLS ciphertext and must
+    # be decrypted via the davey session before they reach the Opus decoder.
+    # When the decrypt cannot run yet (session not ready / ssrc unmapped /
+    # handshake race) the ciphertext hits the decoder -> OpusError('corrupted
+    # stream') -> the PacketRouter thread dies and receive goes deaf for the
+    # rest of the call. Two idempotent in-place class patches keep the router
+    # alive and log WHY the decrypt was skipped (throttled), so agent.log
+    # shows the real blocker instead of silence.
+    try:
+        from discord.ext.voice_recv import opus as _vr_opus  # type: ignore
+
+        logger.info(
+            "VoiceLive: DAVE hardening code ran (pid=%d, already_applied=%s)",
+            os.getpid(), getattr(_vr_opus.PacketDecoder, "_hermes_dave_hardened", False),
+        )
+
+        if not getattr(_vr_opus.PacketDecoder, "_hermes_dave_hardened_v2", False):
+            _SILENCE_PCM_20MS = bytes(3840)  # 20ms @ 48kHz stereo s16le
+            _dave_stats: Dict[str, int] = {
+                "decrypt_ok": 0,
+                "decrypt_exc": 0,
+                "nvc": 0,  # NoValidCryptorFound — stale epoch keys after reconnect/rekey
+                "passthrough_exc": 0,  # UnencryptedWhenPassthroughDisabled — benign
+                "skip_no_session": 0,
+                "skip_not_ready": 0,
+                "skip_v0": 0,
+                "skip_no_ssrc": 0,
+                "decode_fail": 0,
+            }
+
+            def _dave_note(key: str, detail: str, every: int = 500) -> None:
+                _dave_stats[key] = _dave_stats.get(key, 0) + 1
+                n = _dave_stats[key]
+                if n == 1 or n % every == 0:
+                    logger.info("VoiceLive[DAVE]: %s (%s) total=%d", key, detail, n)
+
+            _orig_decode_packet = _vr_opus.PacketDecoder._decode_packet
+
+            def _hardened_decode_packet(self, packet):  # noqa: ANN001
+                try:
+                    return _orig_decode_packet(self, packet)
+                except Exception as exc:  # noqa: BLE001 — keep the router alive
+                    _dave_note("decode_fail", "ssrc=%s %r" % (getattr(self, "ssrc", None), exc), every=200)
+                    return packet, _SILENCE_PCM_20MS
+
+            def _instrumented_dave_decrypt(self, packet):  # noqa: ANN001
+                if _vr_opus.davey is None or not packet or not packet.decrypted_data:
+                    return
+                state = getattr(self.sink.voice_client, "_connection", None)
+                session = getattr(state, "dave_session", None)
+                if session is None:
+                    _dave_note("skip_no_session", "ssrc=%s" % self.ssrc)
+                    return
+                if not getattr(session, "ready", False):
+                    _dave_note("skip_not_ready", "ssrc=%s status=%s" % (self.ssrc, getattr(session, "status", None)))
+                    return
+                if getattr(state, "dave_protocol_version", 0) == 0:
+                    _dave_note("skip_v0", "ssrc=%s" % self.ssrc)
+                    return
+                user_id = self._cached_id
+                if user_id is None:
+                    _dave_note("skip_no_ssrc", "ssrc=%s" % self.ssrc)
+                    return
+                try:
+                    packet.decrypted_data = session.decrypt(
+                        int(user_id), _vr_opus.davey.MediaType.audio, bytes(packet.decrypted_data)
+                    )
+                    _dave_stats["decrypt_ok"] += 1
+                    if _dave_stats["decrypt_ok"] == 1:
+                        logger.info("VoiceLive[DAVE]: decrypt OK (ssrc=%s user=%s)", self.ssrc, user_id)
+                except Exception as exc:  # noqa: BLE001 — passthrough / ratchet race
+                    _dave_note("decrypt_exc", "ssrc=%s user=%s %r" % (self.ssrc, user_id, exc))
+                    if "UnencryptedWhenPassthroughDisabled" in str(exc):
+                        _dave_note("passthrough_exc", "ssrc=%s" % self.ssrc, every=1000)
+                    else:
+                        _dave_note("nvc", "ssrc=%s user=%s" % (self.ssrc, user_id))
+
+            _vr_opus.PacketDecoder._decode_packet = _hardened_decode_packet
+            _vr_opus.PacketDecoder._dave_decrypt = _instrumented_dave_decrypt
+            _vr_opus.PacketDecoder._hermes_dave_hardened = True
+            _vr_opus.PacketDecoder._hermes_dave_hardened_v2 = True
+            _vr_opus.PacketDecoder._hermes_dave_stats = _dave_stats
+            logger.info("VoiceLive: DAVE receive-hardening applied to voice_recv.PacketDecoder (pid=%d)", os.getpid())
+    except Exception as _hermes_dave_exc:  # noqa: BLE001
+        logger.warning("VoiceLive: DAVE receive-hardening patch failed: %r", _hermes_dave_exc)
+    # ── end HERMES PATCH ───────────────────────────────────────────────────
+
     class GeminiPCMSink(voice_recv.AudioSink):
         """Receive decoded Discord PCM and forward 16 kHz mono chunks to Gemini."""
 
@@ -5043,8 +5131,14 @@ class VoiceLiveBridge:
             if not self._running or not self._vc or not self._vc.is_connected():
                 return
             try:
+                # Never early-return on is_listening(): after a router crash the
+                # listener can still report listening while decoding nothing
+                # (observed 2026-10-05). Tear down and re-attach a fresh sink.
                 if hasattr(self._vc, "is_listening") and self._vc.is_listening():
-                    return
+                    try:
+                        self._vc.stop_listening()
+                    except Exception:
+                        pass
                 self._listener = GeminiPCMSink(self._feed_audio)
                 self._vc.listen(self._listener, after=self._on_listen_end)
                 logger.info("VoiceLive: voice receive restarted")
@@ -5053,15 +5147,114 @@ class VoiceLiveBridge:
         finally:
             self._receive_restarting = False
 
+    async def _reinit_dave_session(self, reason: str) -> bool:
+        """Re-establish DAVE E2EE receive keys after a reconnect or rekey.
+
+        A voice blip rebuilds the MLS group; discord.py only re-inits the
+        davey session on fresh connects, so a resumed session keeps stale
+        epoch keys and every inbound frame fails NoValidCryptorFound (bot
+        goes deaf). Reinit re-sends our key package so the cryptors recover.
+        """
+        vc = self._vc
+        state = getattr(vc, "_connection", None) if vc is not None else None
+        if state is None or getattr(state, "dave_protocol_version", 0) <= 0:
+            return False
+        reinit = getattr(state, "reinit_dave_session", None)
+        if reinit is None:
+            return False
+        try:
+            await reinit()
+            logger.info("VoiceLive: DAVE session re-initialized (%s)", reason)
+            return True
+        except Exception as exc:
+            logger.warning("VoiceLive: DAVE reinit failed (%s): %s", reason, exc)
+            return False
+
+    async def _dave_health_tick(self) -> None:
+        """Sample DAVE decrypt counters; if NoValidCryptorFound dominates the
+        inbound frames, the session's epoch keys are stale (reconnect/rekey)
+        and the bot is deaf — attempt a bounded number of session reinits."""
+        now = time.monotonic()
+        if now - getattr(self, "_dave_health_last", 0.0) < 5.0:
+            return
+        self._dave_health_last = now
+        _vr = globals().get("_vr_opus")
+        stats = getattr(_vr.PacketDecoder, "_hermes_dave_stats", None) if _vr is not None else None
+        if not isinstance(stats, dict):
+            return
+        nvc = int(stats.get("nvc", 0))
+        ok = int(stats.get("decrypt_ok", 0))
+        prev = getattr(self, "_dave_health_prev", None)
+        self._dave_health_prev = (nvc, ok, now)
+        if prev is None:
+            return
+        prev_nvc, prev_ok, prev_t = prev
+        dt = max(now - prev_t, 0.001)
+        nvc_rate = (nvc - prev_nvc) / dt
+        ok_delta = ok - prev_ok
+        if ok_delta > 0 or nvc_rate < 10.0:
+            self._dave_reinit_attempts = 0
+            self._dave_reinit_at = 0.0
+            self._dave_reinit_exhausted_logged = False
+            return
+        attempts = getattr(self, "_dave_reinit_attempts", 0)
+        if attempts >= 3:
+            if not getattr(self, "_dave_reinit_exhausted_logged", False):
+                self._dave_reinit_exhausted_logged = True
+                logger.error(
+                    "VoiceLive: DAVE receive still deaf after %d reinits (nvc=%.0f/s) — "
+                    "leave + rejoin (voice-live-leave, voice-live) to recover",
+                    attempts, nvc_rate,
+                )
+            return
+        if now - getattr(self, "_dave_reinit_at", 0.0) < 30.0:
+            return
+        self._dave_reinit_at = now
+        self._dave_reinit_attempts = attempts + 1
+        logger.warning(
+            "VoiceLive: DAVE receive deaf (nvc=%.0f/s ok+%d) — reinit attempt %d/3",
+            nvc_rate, ok_delta, self._dave_reinit_attempts,
+        )
+        await self._reinit_dave_session("health-guard")
+
     async def _connection_watchdog(self) -> None:
+        # Tolerate transient Discord voice drops: discord.py auto-reconnects the voice
+        # client on its own (observed ~30s). Only stop the bridge if the link stays
+        # down past the grace window; on recovery, re-arm playback + receive.
+        reconnect_grace_s = 180.0
+        disconnect_since: Optional[float] = None
         while self._running:
             await asyncio.sleep(1.0)
             if not self._vc or not self._vc.is_connected():
                 if not self._running:
                     return
-                logger.warning("VoiceLive: Discord disconnected. Stopping bridge.")
-                await self.stop()
-                return
+                if disconnect_since is None:
+                    disconnect_since = time.monotonic()
+                    logger.warning(
+                        "VoiceLive: Discord voice disconnected — waiting up to %.0fs for auto-reconnect.",
+                        reconnect_grace_s,
+                    )
+                    continue
+                if time.monotonic() - disconnect_since >= reconnect_grace_s:
+                    logger.warning(
+                        "VoiceLive: Discord disconnected for %.0fs. Stopping bridge.",
+                        time.monotonic() - disconnect_since,
+                    )
+                    await self.stop()
+                    return
+                continue
+            if disconnect_since is not None:
+                logger.info(
+                    "VoiceLive: voice connection restored after %.1fs — re-arming audio.",
+                    time.monotonic() - disconnect_since,
+                )
+                disconnect_since = None
+                try:
+                    self._wake_playback()
+                    self._recreate_pcm_sink()
+                    await self._reinit_dave_session("voice reconnect")
+                except Exception as exc:
+                    logger.error("VoiceLive: post-reconnect re-arm failed: %s", exc)
 
             # ── User-presence check: stop if B leaves the voice channel ─────
             try:
@@ -5078,6 +5271,12 @@ class VoiceLiveBridge:
                         return
             except Exception as exc:
                 logger.debug("VoiceLive: presence check failed: %s", exc)
+
+            # ── DAVE receive health: auto-heal stale E2EE cryptors ─────────
+            try:
+                await self._dave_health_tick()
+            except Exception as exc:
+                logger.debug("VoiceLive: dave health tick failed: %s", exc)
 
             now = time.monotonic()
             idle = now - self._last_activity_at
