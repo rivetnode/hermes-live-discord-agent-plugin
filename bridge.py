@@ -63,6 +63,20 @@ except Exception:  # mcp_tools not importable in some test contexts
     MCP_TOOL_PREFIX = "mcp_"
     mcp_tools_to_gemini_declarations = None  # type: ignore
 
+# Fase 5 (parte 2): Hub de conversaciones canónicas — ver canonical_hub.py
+try:
+    from canonical_hub import (  # type: ignore
+        append_turns as _hub_append_turns,
+        endpoint_id_for as _hub_endpoint_id_for,
+        ensure_conversation as _hub_ensure_conversation,
+        provision_surfaces as _hub_provision_surfaces,
+    )
+except Exception:  # canonical_hub not importable in some test contexts
+    _hub_append_turns = None  # type: ignore
+    _hub_endpoint_id_for = None  # type: ignore
+    _hub_ensure_conversation = None  # type: ignore
+    _hub_provision_surfaces = None  # type: ignore
+
 logging.basicConfig(
     level=logging.DEBUG,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
@@ -206,6 +220,13 @@ MCP_VOICE_TOOLS_ENABLED = os.getenv(
 ).lower() in {"1", "true", "yes", "on"}
 MCP_URL = os.getenv("DISCORD_VOICE_MCP_URL", "http://127.0.0.1:9999/mcp")
 MCP_TOKEN = os.getenv("DISCORD_VOICE_MCP_TOKEN", "")
+HUB_VOICE_ENABLED = os.getenv(
+    "DISCORD_VOICE_LIVE_HUB", "true"
+).lower() in {"1", "true", "yes", "on"}
+HUB_TENANT = os.getenv("DISCORD_VOICE_HUB_TENANT", "t1")
+HUB_SURFACES_ENABLED = os.getenv(
+    "DISCORD_VOICE_HUB_SURFACES", "true"
+).lower() in {"1", "true", "yes", "on"}
 WEB_VOICE_TOOLS_ENABLED = os.getenv(
     "DISCORD_VOICE_LIVE_WEB_TOOLS", "true"
 ).lower() in {"1", "true", "yes", "on"}
@@ -4259,6 +4280,15 @@ class GeminiLiveBridge:
     ):
         self._ws = None
         self._output_source = output_source
+        # Fase 5 (parte 2): Hub de conversaciones canónicas (voz de Discord)
+        self._hub_conv_id: Optional[str] = None
+        self._hub_endpoint_id: Optional[str] = None
+        self._hub_in_buf: List[str] = []
+        self._hub_out_buf: List[str] = []
+        self._hub_lock: Optional[asyncio.Lock] = None
+        self._hub_boot_task = None
+        self._hub_guild_id = None
+        self._hub_channel = None
         # Register the output source in the sfx module so cross-bridge
         # sfx triggers (notification, error, tool_init) can find it
         # (criterion #8 — multi-slot UI sfx library).
@@ -4667,6 +4697,11 @@ class GeminiLiveBridge:
                     logger.info("MCP Hermes voice tools registered (count=%d)", len(_mcp_decls))
             except Exception as exc:
                 logger.warning("MCP voice tools setup failed: %s", exc)
+        if HUB_VOICE_ENABLED and _hub_ensure_conversation is not None:
+            try:
+                self._hub_start()
+            except Exception as exc:
+                logger.warning("Hub voice link setup failed: %s", exc)
         if handle is not None:
             setup_payload["sessionResumption"] = {"handle": handle}
             logger.info("Session resumption: handle=%s", handle)
@@ -4684,9 +4719,115 @@ class GeminiLiveBridge:
             return
         msg = {"realtimeInput": {"text": text.strip()}}
         await self._ws.send(json.dumps(msg))
+        self._hub_note("input", text.strip())
+
+    # ── Fase 5 (parte 2): puente al Hub de conversaciones canónicas ──────
+
+    def _hub_note(self, direction: str, text: str) -> None:
+        """Acumula texto de turnos para el journal del Hub (fail-open)."""
+        try:
+            if not HUB_VOICE_ENABLED or _hub_append_turns is None:
+                return
+            txt = str(text or "").strip()
+            if not txt:
+                return
+            buf = self._hub_out_buf if direction == "output" else self._hub_in_buf
+            buf.append(txt)
+        except Exception:
+            pass
+
+    def _hub_flush_turn(self) -> None:
+        """Dispara el envío del turno al Hub sin bloquear el receive loop."""
+        try:
+            if not HUB_VOICE_ENABLED or _hub_append_turns is None:
+                return
+            inp = [t for t in self._hub_in_buf if t.strip()]
+            out = [t for t in self._hub_out_buf if t.strip()]
+            self._hub_in_buf.clear()
+            self._hub_out_buf.clear()
+            if not inp and not out:
+                return
+            loop = asyncio.get_running_loop()
+            loop.create_task(self._hub_send_turn(inp, out))
+        except Exception as exc:
+            logger.debug("hub flush failed: %s", exc)
+
+    async def _hub_send_turn(self, inp: List[str], out: List[str]) -> None:
+        try:
+            if self._hub_lock is None:
+                self._hub_lock = asyncio.Lock()
+            async with self._hub_lock:
+                await asyncio.to_thread(self._hub_send_turn_sync, inp, out)
+        except Exception as exc:
+            logger.warning("hub send turn failed: %s", exc)
+
+    def _hub_send_turn_sync(self, inp: List[str], out: List[str]) -> None:
+        linked = self._hub_ensure()
+        if not linked:
+            return
+        conv, ep_id = linked
+        now = time.time()
+        name = ""
+        try:
+            if self._user_profile is not None:
+                name = str(getattr(self._user_profile, "display_name", "") or "")
+        except Exception:
+            name = ""
+        turns: List[tuple] = [("human", t, now) for t in inp]
+        turns += [("voice_agent", t, now + 0.001) for t in out]
+        try:
+            _hub_append_turns(ep_id, conv, turns, session_key=ep_id, user_name=name)
+        except Exception as exc:
+            logger.warning("hub append failed: %s", exc)
+
+    def _hub_ensure(self):
+        """Asegura endpoint+conv (rápido, idempotente); cachea en la sesión."""
+        try:
+            if self._hub_conv_id and self._hub_endpoint_id:
+                return (self._hub_conv_id, self._hub_endpoint_id)
+            gid = self._hub_guild_id
+            ch = self._hub_channel
+            if gid is None or ch is None:
+                return None
+            cid = getattr(ch, "id", None)
+            if cid is None:
+                return None
+            title = "Voz Discord · " + str(getattr(ch, "name", cid))
+            conv = _hub_ensure_conversation(gid, cid, title, HUB_TENANT)
+            if not conv:
+                return None
+            self._hub_conv_id = conv
+            self._hub_endpoint_id = _hub_endpoint_id_for(gid, cid)
+            return (conv, self._hub_endpoint_id)
+        except Exception as exc:
+            logger.warning("hub ensure failed: %s", exc)
+            return None
+
+    def _hub_start(self) -> None:
+        """Bootstrap único por bridge: claim + (background) surfaces."""
+        if self._hub_boot_task is not None:
+            return
+
+        async def _boot() -> None:
+            try:
+                linked = await asyncio.to_thread(self._hub_ensure)
+                if not linked:
+                    return
+                if HUB_SURFACES_ENABLED and _hub_provision_surfaces is not None:
+                    ch = self._hub_channel
+                    title = "Voz Discord · " + str(getattr(ch, "name", ""))
+                    await asyncio.to_thread(_hub_provision_surfaces, linked[0], title, HUB_TENANT)
+            except Exception as exc:
+                logger.debug("hub bootstrap failed: %s", exc)
+
+        try:
+            self._hub_boot_task = asyncio.get_running_loop().create_task(_boot())
+        except Exception as exc:
+            logger.debug("hub start failed: %s", exc)
 
     async def disconnect(self):
         self._running = False
+        self._hub_flush_turn()
         _put_drop_oldest(self._send_q, None)
         for t in self._tasks:
             t.cancel()
@@ -4870,10 +5011,12 @@ class GeminiLiveBridge:
                     if OUTPUT_CLEAR_ON_INTERRUPT:
                         self._output_source.clear()
                     self._output_turn_open = False
+                    self._hub_flush_turn()
                 if sc.get("turnComplete") or sc.get("generationComplete"):
                     if self._output_turn_open and OUTPUT_TAIL_PAD_MS > 0:
                         self._output_source.feed(_silence_pcm(GEMINI_OUT_SR, GEMINI_OUT_CH, OUTPUT_TAIL_PAD_MS))
                     self._output_turn_open = False
+                    self._hub_flush_turn()
             # ── Handle tool calls from Gemini ──────────────────────────────────────
             tool_call = msg.get("toolCall")
             if tool_call:
@@ -5125,6 +5268,12 @@ class VoiceLiveBridge:
             on_reconnect=self._recreate_pcm_sink,
             user_profile=user_profile,
         )
+        try:
+            # Fase 5 (parte 2): identidad del canal para el Hub canónico
+            self._gemini._hub_guild_id = self._guild_id
+            self._gemini._hub_channel = self._channel
+        except Exception:
+            pass
         self._running = False
         self._started_at = None
         self._watcher_task: Optional[asyncio.Task] = None
