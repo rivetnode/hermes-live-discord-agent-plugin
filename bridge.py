@@ -51,6 +51,18 @@ try:
 except Exception:  # user_profiles not importable in some test contexts
     _rkt = None
 
+# Fase 5: MCP local de Hermes (memoria, skills, sesiones, chat) — ver mcp_tools.py
+try:
+    from mcp_tools import (  # type: ignore
+        HermesMCPClient,
+        MCP_TOOL_PREFIX,
+        mcp_tools_to_gemini_declarations,
+    )
+except Exception:  # mcp_tools not importable in some test contexts
+    HermesMCPClient = None  # type: ignore
+    MCP_TOOL_PREFIX = "mcp_"
+    mcp_tools_to_gemini_declarations = None  # type: ignore
+
 logging.basicConfig(
     level=logging.DEBUG,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
@@ -189,6 +201,11 @@ NOTES_DIR = Path(os.getenv("DISCORD_VOICE_LIVE_NOTES_DIR", str(Path.home() / ".h
 SPOTIFY_VOICE_TOOLS_ENABLED = os.getenv(
     "DISCORD_VOICE_LIVE_SPOTIFY_TOOLS", "true"
 ).lower() in {"1", "true", "yes", "on"}
+MCP_VOICE_TOOLS_ENABLED = os.getenv(
+    "DISCORD_VOICE_LIVE_MCP_TOOLS", "true"
+).lower() in {"1", "true", "yes", "on"}
+MCP_URL = os.getenv("DISCORD_VOICE_MCP_URL", "http://127.0.0.1:9999/mcp")
+MCP_TOKEN = os.getenv("DISCORD_VOICE_MCP_TOKEN", "")
 WEB_VOICE_TOOLS_ENABLED = os.getenv(
     "DISCORD_VOICE_LIVE_WEB_TOOLS", "true"
 ).lower() in {"1", "true", "yes", "on"}
@@ -4276,6 +4293,10 @@ class GeminiLiveBridge:
         # sobre el perfil. Cache por sesión (reconnects no releen).
         self._store_checked = False
         self._store_model: Optional[str] = None
+        # Fase 5: MCP de Hermes (descubierto una vez por sesión)
+        self._mcp_client = None
+        self._mcp_declarations: Optional[List[Dict[str, Any]]] = None
+        self._mcp_tool_names: set = set()
         self._send_q: "queue.Queue[Optional[bytes]]" = queue.Queue(maxsize=256)
         self._video_q: "queue.Queue[Optional[Dict[str, Any]]]" = queue.Queue(maxsize=2)
         self._tasks: List[asyncio.Task] = []
@@ -4632,6 +4653,20 @@ class GeminiLiveBridge:
             if _gh:
                 setup_payload["tools"].append({"functionDeclarations": _gh})
                 logger.info("GitHub voice tools registered (count=%d)", len(_gh))
+        if (
+            MCP_VOICE_TOOLS_ENABLED
+            and HermesMCPClient is not None
+            and mcp_tools_to_gemini_declarations is not None
+        ):
+            try:
+                _mcp_decls = _filter_for_user(await self._ensure_mcp_declarations())
+                if _mcp_decls:
+                    if "tools" not in setup_payload:
+                        setup_payload["tools"] = []
+                    setup_payload["tools"].append({"functionDeclarations": _mcp_decls})
+                    logger.info("MCP Hermes voice tools registered (count=%d)", len(_mcp_decls))
+            except Exception as exc:
+                logger.warning("MCP voice tools setup failed: %s", exc)
         if handle is not None:
             setup_payload["sessionResumption"] = {"handle": handle}
             logger.info("Session resumption: handle=%s", handle)
@@ -4893,6 +4928,56 @@ class GeminiLiveBridge:
         except Exception:
             logger.warning("VoiceLive: could not append note event", exc_info=True)
 
+    async def _ensure_mcp_declarations(self):
+        """Descubre las tools del MCP de Hermes (una vez por sesión, fail-open).
+
+        Devuelve las signatures prefijadas mcp_* y registra los nombres en el
+        vocabulario del allowlist por perfil. Si el MCP no está, devuelve [].
+        """
+        if self._mcp_declarations is not None:
+            return self._mcp_declarations
+        decls: List[Dict[str, Any]] = []
+        try:
+            client = HermesMCPClient(MCP_URL, MCP_TOKEN or None)
+            if await client.connect():
+                tools = await client.list_tools()
+                decls = mcp_tools_to_gemini_declarations(tools)
+                self._mcp_client = client
+                if _rkt is not None:
+                    for d in decls:
+                        try:
+                            _rkt(d["name"])
+                        except Exception:
+                            pass
+                self._mcp_tool_names = {d["name"] for d in decls}
+                logger.info(
+                    "MCP Hermes: %d tools (%s)",
+                    len(decls),
+                    ", ".join(sorted(self._mcp_tool_names)) or "-",
+                )
+            else:
+                logger.warning("MCP Hermes no disponible; la voz continúa sin sus tools")
+        except Exception as exc:
+            logger.warning("MCP Hermes discovery failed: %s", exc)
+        self._mcp_declarations = decls
+        return decls
+
+    async def _call_mcp_tool(self, prefixed_name: str, args: Dict[str, Any]) -> Dict[str, Any]:
+        """Invoca una tool mcp_* del MCP de Hermes; respuesta lista para Gemini."""
+        real = (
+            prefixed_name[len(MCP_TOOL_PREFIX):]
+            if prefixed_name.startswith(MCP_TOOL_PREFIX)
+            else prefixed_name
+        )
+        client = self._mcp_client
+        if client is None:
+            client = HermesMCPClient(MCP_URL, MCP_TOKEN or None)
+            self._mcp_client = client
+        text = await client.call_tool(real, args if isinstance(args, dict) else {})
+        if text is None:
+            return {"error": f"sin respuesta del MCP de Hermes para {real}"}
+        return {"result": text}
+
     async def _handle_tool_call(self, tool_call: Any) -> None:
         """Execute Spotify, web, or other local tools requested by Gemini Live.
 
@@ -4969,6 +5054,8 @@ class GeminiLiveBridge:
                             _run_opencode_tool_with_bridge,
                             name, args, _user_id, self,
                         )
+                    elif name in self._mcp_tool_names:
+                        result = await self._call_mcp_tool(name, args)
                     else:
                         result = {"error": f"No handler for tool: {name}"}
                 except Exception as exc:

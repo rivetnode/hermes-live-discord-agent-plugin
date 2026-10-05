@@ -28,3 +28,5 @@ jobs:
         run: python3 -m unittest tests.test_interrupt_latency -v
       - name: test_transcript_latency
         run: python3 -m unittest tests.test_transcript_latency -v
+      - name: test_mcp_tools
+        run: python3 -m unittest tests.test_mcp_tools -v
