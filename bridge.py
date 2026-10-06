@@ -5005,7 +5005,7 @@ class GeminiLiveBridge:
                 pass
 
     async def _run_conv_tool(self, name: str, args: Dict[str, Any]) -> Dict[str, Any]:
-        """conv_find / conv_attach / conv_current — pistas + retomar."""
+        """conv_find / conv_attach / conv_current / conv_rename — pistas + retomar."""
         linked = await asyncio.to_thread(self._hub_ensure)
         if not linked:
             return {"error": "Hub de conversaciones no disponible"}
@@ -5014,6 +5014,14 @@ class GeminiLiveBridge:
         if name == "conv_current":
             res = await asyncio.to_thread(conv_control_plane, "/conv current", ep_id)
             return {"result": res.get("text") or "No sé en qué conversación estoy."}
+        if name == "conv_rename":
+            titulo = str(args.get("nombre") or "").strip()
+            if not titulo:
+                return {"error": "Falta el nombre nuevo de la conversación"}
+            res = await asyncio.to_thread(conv_control_plane, f"/conv rename {titulo}", ep_id)
+            if res.get("ok"):
+                return {"result": res.get("text") or f"Listo, se llama «{titulo}»."}
+            return {"error": res.get("text") or "No pude renombrar la conversación"}
         if name == "conv_find":
             # Sin pistas → el control plane devuelve las RECIENTES (6-oct).
             q = str(args.get("consulta") or "").strip()
@@ -5417,7 +5425,7 @@ class GeminiLiveBridge:
                             _run_opencode_tool_with_bridge,
                             name, args, _user_id, self,
                         )
-                    elif name in ("conv_find", "conv_attach", "conv_current"):
+                    elif name in ("conv_find", "conv_attach", "conv_current", "conv_rename"):
                         result = await self._run_conv_tool(name, args)
                     elif name in self._mcp_tool_names:
                         result = await self._call_mcp_tool(name, args)
@@ -6318,6 +6326,22 @@ _CONV_FUNCTION_DECLARATIONS = [
             "o dónde quedamos, o si dudas del estado antes de conv_attach."
         ),
         "parameters": {"type": "object", "properties": {}, "required": []},
+    },
+    {
+        "name": "conv_rename",
+        "description": (
+            "Renombra la conversación ACTIVA (el nombre se propaga a sus "
+            "canales: Telegram y Discord). Úsala cuando el usuario pida "
+            "cambiar el nombre de la conversación en la que están. Si pide "
+            "renombrar OTRA conversación, primero conv_find + conv_attach y "
+            "después conv_rename. Repite el nombre nuevo tal cual lo diga el "
+            "usuario y confírmalo antes si suena ambiguo."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {"nombre": {"type": "string", "description": "Nombre nuevo de la conversación"}},
+            "required": ["nombre"],
+        },
     },
 ]
 
