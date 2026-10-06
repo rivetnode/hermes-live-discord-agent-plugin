@@ -66,16 +66,22 @@ except Exception:  # mcp_tools not importable in some test contexts
 # Fase 5 (parte 2): Hub de conversaciones canónicas — ver canonical_hub.py
 try:
     from canonical_hub import (  # type: ignore
+        acknowledge_voice_context as _hub_voice_ack,
         append_turns as _hub_append_turns,
         endpoint_id_for as _hub_endpoint_id_for,
         ensure_conversation as _hub_ensure_conversation,
         provision_surfaces as _hub_provision_surfaces,
+        voice_context_block as _hub_voice_context_block,
+        voice_seed_block as _hub_voice_seed_block,
     )
 except Exception:  # canonical_hub not importable in some test contexts
     _hub_append_turns = None  # type: ignore
     _hub_endpoint_id_for = None  # type: ignore
     _hub_ensure_conversation = None  # type: ignore
     _hub_provision_surfaces = None  # type: ignore
+    _hub_voice_ack = None  # type: ignore
+    _hub_voice_context_block = None  # type: ignore
+    _hub_voice_seed_block = None  # type: ignore
 
 logging.basicConfig(
     level=logging.DEBUG,
@@ -145,6 +151,41 @@ def _read_store_voice_settings(user_id: str) -> Tuple[Optional[str], Optional[st
     except Exception as exc:  # noqa: BLE001 — fail-open deliberado
         logger.warning("discord-voice: store voice read failed: %s", exc)
     return None, None
+
+
+def conv_control_plane(text: str, endpoint_id: str, timeout: float = 15.0) -> dict:
+    """Control plane /conv (CLI) para la voz — mismo camino del store de /voz.
+
+    Devuelve el dict del control plane ({"ok", "text", ...}) o un error
+    sintético fail-open. NUNCA lanza — la voz sigue si el CLI falla.
+    """
+    py = os.path.join(_EKO_LIVEKIT_DIR, ".venv", "bin", "python")
+    if not os.path.exists(py):
+        py = sys.executable
+    try:
+        proc = subprocess.run(
+            [
+                py, "-m", "eko.hub.commands",
+                "--endpoint-id", endpoint_id,
+                "--tenant-id", HUB_TENANT,
+                "--channel", "discord",
+                "--channel-account-id", str(endpoint_id).split(":")[-1],
+            ],
+            input=json.dumps({"text": text, "tenant_id": HUB_TENANT, "channel": "discord"}),
+            capture_output=True, text=True, timeout=timeout,
+            cwd=_EKO_LIVEKIT_DIR,
+            env={**os.environ, "PYTHONPATH": _EKO_LIVEKIT_DIR},
+        )
+        if proc.returncode != 0:
+            logger.warning(
+                "discord-voice: conv control plane rc=%s stderr=%s",
+                proc.returncode, (proc.stderr or "")[:200],
+            )
+            return {"ok": False, "text": "El control plane no respondió; intenta de nuevo."}
+        return json.loads(proc.stdout.strip() or "{}")
+    except Exception as exc:  # noqa: BLE001 — fail-open deliberado
+        logger.warning("discord-voice: conv control plane failed: %s", exc)
+        return {"ok": False, "text": "No pude hablar con el control plane."}
 INITIAL_GREETING = os.getenv(
     "DISCORD_VOICE_LIVE_GREETING",
     "I'm here.",
@@ -1754,6 +1795,12 @@ _LOCAL_FUNCTION_DECLARATIONS = [
 
 LOCAL_VOICE_TOOLS_ENABLED = os.getenv(
     "DISCORD_VOICE_LIVE_LOCAL_TOOLS", "true"
+).lower() in {"1", "true", "yes", "on"}
+
+# conversation-follow (5-oct-2026): retomar conversaciones desde la voz —
+# conv_find/conv_attach (control plane /conv find|attach) + catch-up.
+CONV_VOICE_TOOLS_ENABLED = os.getenv(
+    "DISCORD_VOICE_LIVE_CONV_TOOLS", "true"
 ).lower() in {"1", "true", "yes", "on"}
 
 # ── OpenCode delegation tools (tmux-backed PTY sessions) ─────────────────
@@ -4289,6 +4336,9 @@ class GeminiLiveBridge:
         self._hub_boot_task = None
         self._hub_guild_id = None
         self._hub_channel = None
+        # conversation-follow (5-oct): seed de contexto tras attach + guard
+        self._hub_seed_pending = False
+        self._hub_sync_inflight = False
         # Register the output source in the sfx module so cross-bridge
         # sfx triggers (notification, error, tool_init) can find it
         # (criterion #8 — multi-slot UI sfx library).
@@ -4505,6 +4555,7 @@ class GeminiLiveBridge:
         self._tasks = [
             asyncio.create_task(self._send_loop()),
             asyncio.create_task(self._receive_loop()),
+            asyncio.create_task(self._hub_context_loop()),
         ]
         if INITIAL_GREETING and not self._reconnecting:
             await self.send_text(INITIAL_GREETING)
@@ -4676,6 +4727,13 @@ class GeminiLiveBridge:
             if _si:
                 setup_payload["tools"].append({"functionDeclarations": _si})
                 logger.info("SysInspect voice tools registered (count=%d)", len(_si))
+        if CONV_VOICE_TOOLS_ENABLED:
+            if "tools" not in setup_payload:
+                setup_payload["tools"] = []
+            _conv = _filter_for_user(_CONV_FUNCTION_DECLARATIONS)
+            if _conv:
+                setup_payload["tools"].append({"functionDeclarations": _conv})
+                logger.info("Conv voice tools registered (count=%d)", len(_conv))
         if GITHUB_VOICE_TOOLS_ENABLED:
             if "tools" not in setup_payload:
                 setup_payload["tools"] = []
@@ -4824,6 +4882,117 @@ class GeminiLiveBridge:
             self._hub_boot_task = asyncio.get_running_loop().create_task(_boot())
         except Exception as exc:
             logger.debug("hub start failed: %s", exc)
+
+    # ── conversation-follow (5-oct): retomar + catch-up de contexto ──────
+
+    def hub_apply_attach(self, conv_id: str) -> None:
+        """Hot-swap tras /conv attach: la sesión viva sigue la conv nueva.
+
+        El rebind en el Hub ya lo hizo el control plane (start_from_present);
+        acá se actualiza el cache de ESTA sesión y se pide un seed de
+        contexto para retomar sabiendo qué venía diciéndose.
+        """
+        if not conv_id:
+            return
+        self._hub_conv_id = conv_id
+        self._hub_seed_pending = True
+        try:
+            asyncio.get_running_loop().create_task(self._sync_hub_context())
+        except RuntimeError:
+            pass  # sin loop (tests) — el loop periódico lo tomará
+        logger.info("VoiceLive: attach aplicado → %s (seed pendiente)", conv_id)
+
+    async def _inject_silent_context(self, text: str) -> bool:
+        """clientContent silencioso (turnComplete=False) — contexto, no turno."""
+        if not text or not self._ws:
+            return False
+        try:
+            await self._ws.send(json.dumps({
+                "clientContent": {
+                    "turns": [{"role": "user", "parts": [{"text": text}]}],
+                    "turnComplete": False,
+                }
+            }))
+            return True
+        except Exception as exc:
+            logger.warning("VoiceLive: contexto silencioso falló: %r", exc)
+            return False
+
+    async def _sync_hub_context(self) -> None:
+        """Catch-up: eventos ajenos del Hub → contexto silencioso (F4.16).
+
+        At-least-once: el cursor de voz SOLO avanza tras envío OK. Con un
+        turno de salida en curso se pospone al siguiente tick (no interrumpe).
+        """
+        if not HUB_VOICE_ENABLED or _hub_voice_context_block is None:
+            return
+        if not self._running or self._ws is None:
+            return
+        if self._output_turn_open:
+            return
+        if getattr(self, "_hub_sync_inflight", False):
+            return
+        self._hub_sync_inflight = True
+        try:
+            linked = await asyncio.to_thread(self._hub_ensure)
+            if not linked:
+                return
+            _conv, ep_id = linked
+            if self._hub_seed_pending:
+                block, through = await asyncio.to_thread(_hub_voice_seed_block, ep_id)
+                if block:
+                    if not await self._inject_silent_context(block):
+                        return  # reintenta el próximo tick (seed sigue pendiente)
+                    await asyncio.to_thread(_hub_voice_ack, ep_id, through)
+                    self._hub_seed_pending = False
+                    logger.info("VoiceLive: seed de conversación inyectado (%s →%s)", ep_id, through)
+                    return
+                self._hub_seed_pending = False
+            block, through = await asyncio.to_thread(_hub_voice_context_block, ep_id)
+            if block:
+                if await self._inject_silent_context(block):
+                    await asyncio.to_thread(_hub_voice_ack, ep_id, through)
+                    logger.info("VoiceLive: catch-up de contexto inyectado (%s →%s)", ep_id, through)
+            elif through:
+                await asyncio.to_thread(_hub_voice_ack, ep_id, through)  # solo propios
+        except Exception as exc:
+            logger.debug("VoiceLive: hub context sync failed: %s", exc)
+        finally:
+            self._hub_sync_inflight = False
+
+    async def _hub_context_loop(self) -> None:
+        """Backstop periódico del catch-up de contexto (conversation-follow)."""
+        while self._running:
+            try:
+                await asyncio.sleep(10.0)
+            except asyncio.CancelledError:
+                return
+            try:
+                await self._sync_hub_context()
+            except Exception:
+                pass
+
+    async def _run_conv_tool(self, name: str, args: Dict[str, Any]) -> Dict[str, Any]:
+        """conv_find / conv_attach — pistas + retomar (conversation-follow)."""
+        linked = await asyncio.to_thread(self._hub_ensure)
+        if not linked:
+            return {"error": "Hub de conversaciones no disponible"}
+        _conv, ep_id = linked
+        args = args if isinstance(args, dict) else {}
+        if name == "conv_find":
+            q = str(args.get("consulta") or "").strip()
+            if not q:
+                return {"error": "Dime qué palabras buscar"}
+            res = await asyncio.to_thread(conv_control_plane, f"/conv find {q}", ep_id)
+            return {"result": res.get("text") or "No encontré nada."}
+        ref = str(args.get("ref") or "").strip()
+        if not ref:
+            return {"error": "Falta el número o nombre de la conversación"}
+        res = await asyncio.to_thread(conv_control_plane, f"/conv attach {ref}", ep_id)
+        if res.get("ok") and res.get("attached"):
+            self.hub_apply_attach(str(res.get("conversation_id") or ""))
+            return {"result": res.get("text") or "Listo."}
+        return {"error": res.get("text") or "No pude retomar esa conversación"}
 
     async def disconnect(self):
         self._running = False
@@ -5197,6 +5366,8 @@ class GeminiLiveBridge:
                             _run_opencode_tool_with_bridge,
                             name, args, _user_id, self,
                         )
+                    elif name in ("conv_find", "conv_attach"):
+                        result = await self._run_conv_tool(name, args)
                     elif name in self._mcp_tool_names:
                         result = await self._call_mcp_tool(name, args)
                     else:
@@ -6025,6 +6196,48 @@ async def run_sidecar(vc, adapter, ready_future: Optional[asyncio.Future] = None
             await BRIDGE.stop()
 
 
+# ── conversation-follow (5-oct-2026): retomar conversaciones ──────────────
+_CONV_FUNCTION_DECLARATIONS = [
+    {
+        "name": "conv_find",
+        "description": (
+            "Busca conversaciones de Hermes por pistas (tema, palabras, nombre) "
+            "cuando el usuario quiera retomar o continuar algo que se habló antes. "
+            "Úsala también antes de conv_attach. Devuelve candidatos numerados."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "consulta": {
+                    "type": "string",
+                    "description": "Palabras clave (ej. 'precios lavadoras')",
+                },
+            },
+            "required": ["consulta"],
+        },
+    },
+    {
+        "name": "conv_attach",
+        "description": (
+            "Retoma una conversación encontrada con conv_find: la sesión actual "
+            "se suscribe a ella y sigue ahí (lo que se diga se agrega a esa "
+            "conversación). Pasa el número del candidato (ej. '2') o un "
+            "fragmento único del nombre."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "ref": {
+                    "type": "string",
+                    "description": "Número del candidato (ej. '2') o fragmento del nombre",
+                },
+            },
+            "required": ["ref"],
+        },
+    },
+]
+
+
 # Register all known tool names with the per-user profile system so the
 # allowlist vocabulary is in sync with the declarations above.
 def _register_all_known_tools():
@@ -6037,6 +6250,7 @@ def _register_all_known_tools():
         _HOMEASSISTANT_FUNCTION_DECLARATIONS,
         _OPENCODE_FUNCTION_DECLARATIONS,
         _SYSINSPECT_FUNCTION_DECLARATIONS,
+        _CONV_FUNCTION_DECLARATIONS,
     ):
         try:
             for d in decl_list:

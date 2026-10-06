@@ -171,3 +171,135 @@ def append_turns(
     except Exception as exc:
         logger.warning("canonical_hub.append_turns failed: %s", exc)
         return False
+
+
+# ── conversation-follow (5-oct-2026): catch-up de contexto + retomar ──────
+# El motor de voz de Discord consume el MISMO contrato del puente webrtc v2
+# (F4.16): cursor propio (last_voice_context_seq), filtro de eventos ajenos,
+# ventaneo por recencia y ACK SOLO tras envío OK (at-least-once).
+
+_CTX_FETCH_LIMIT = 200
+_CTX_MAX_EVENTS = 20
+_CTX_MAX_CHARS = 3600
+_SEED_EVENTS = 14
+
+
+def _trim_block(block: str) -> str:
+    if len(block) > _CTX_MAX_CHARS:
+        block = "…(contexto recortado)…\n" + block[-_CTX_MAX_CHARS:]
+        cut = block.find("\n", 20)
+        if cut > 0:
+            block = block[cut + 1:]
+    return block
+
+
+def voice_context_block(endpoint_id: str):
+    """(bloque de contexto AJENO, through_seq) desde el cursor de voz.
+
+    Recencia sobre exhaustividad (misma política F4.16). ("", through)
+    cuando solo hay eventos propios — el caller puede ACK. ("", 0) cuando no
+    hay nada nuevo. Fail-open: cualquier error → ("", 0).
+    """
+    schema = _load_hub()
+    if schema is None:
+        return ("", 0)
+    try:
+        conn = _connect(schema)
+        try:
+            ep = schema.get_endpoint(conn, endpoint_id)
+            if not ep:
+                return ("", 0)
+            cursor = int(ep.get("last_voice_context_seq") or 0)
+            row = conn.execute(
+                "SELECT COALESCE(MAX(canonical_seq), 0) FROM canonical_events "
+                "WHERE canonical_conversation_id = ?",
+                (ep["canonical_conversation_id"],),
+            ).fetchone()
+            max_seq = int(row[0]) if row and row[0] else 0
+            if max_seq <= cursor:
+                return ("", 0)
+            # min_seq EXPLÍCITO: pending_context sin min_seq usa el cursor del
+            # WORKER (last_context_seq, =0 en estos endpoints) y re-leería
+            # desde el inicio del journal. Aquí manda el cursor de VOZ, con
+            # ventana de recencia si el backlog excede el límite.
+            min_seq = max(cursor, max_seq - _CTX_FETCH_LIMIT)
+            events = schema.pending_context(
+                conn, endpoint_id, limit=_CTX_FETCH_LIMIT + 1, min_seq=min_seq
+            )
+            if not events:
+                return ("", 0)
+            through = max(int(ev.get("canonical_seq") or 0) for ev in events)
+            foreign = [
+                ev for ev in events
+                if (ev.get("origin_endpoint_id") or "") != endpoint_id
+            ]
+            if not foreign:
+                return ("", through)
+            return (_trim_block(schema.render_context_block(foreign, max_events=_CTX_MAX_EVENTS)), through)
+        finally:
+            conn.close()
+    except Exception as exc:
+        logger.warning("canonical_hub.voice_context_block failed: %s", exc)
+        return ("", 0)
+
+
+def voice_seed_block(endpoint_id: str):
+    """Tail reciente de la conv actual — para SEMBRAR al retomar (attach).
+
+    Independiente del cursor: últimos _SEED_EVENTS eventos, filtrados a
+    ajenos con contenido. ("", through) si no hay ajenos (el caller ACK para
+    no repetir). Fail-open.
+    """
+    schema = _load_hub()
+    if schema is None:
+        return ("", 0)
+    try:
+        conn = _connect(schema)
+        try:
+            ep = schema.get_endpoint(conn, endpoint_id)
+            if not ep:
+                return ("", 0)
+            conv = ep["canonical_conversation_id"]
+            row = conn.execute(
+                "SELECT COALESCE(MAX(canonical_seq), 0) FROM canonical_events "
+                "WHERE canonical_conversation_id = ?",
+                (conv,),
+            ).fetchone()
+            max_seq = int(row[0]) if row and row[0] else 0
+            if max_seq <= 0:
+                return ("", 0)
+            after = max(0, max_seq - _SEED_EVENTS)
+            events = schema.events_for_conversation(
+                conn, conv, after_seq=after, limit=_SEED_EVENTS + 1
+            )
+            foreign = [
+                ev for ev in events
+                if (ev.get("origin_endpoint_id") or "") != endpoint_id
+                and (ev.get("content") or "").strip()
+            ]
+            if not foreign:
+                return ("", max_seq)
+            return (_trim_block(schema.render_context_block(foreign, max_events=_SEED_EVENTS)), max_seq)
+        finally:
+            conn.close()
+    except Exception as exc:
+        logger.warning("canonical_hub.voice_seed_block failed: %s", exc)
+        return ("", 0)
+
+
+def acknowledge_voice_context(endpoint_id: str, through: int) -> int:
+    """ACK monotónico del cursor de voz (llamar SOLO tras envío OK)."""
+    if not through:
+        return 0
+    schema = _load_hub()
+    if schema is None:
+        return 0
+    try:
+        conn = _connect(schema)
+        try:
+            return schema.advance_voice_context(conn, endpoint_id, up_to_seq=int(through))
+        finally:
+            conn.close()
+    except Exception as exc:
+        logger.warning("canonical_hub.acknowledge_voice_context failed: %s", exc)
+        return 0

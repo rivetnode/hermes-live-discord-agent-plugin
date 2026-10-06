@@ -164,5 +164,68 @@ class TestCanonicalHubIntegration(unittest.TestCase):
         self.assertEqual(conv, conv2)
 
 
+class TestConversationFollow(unittest.TestCase):
+    """conversation-follow (5-oct): catch-up de contexto + seed (camino real)."""
+
+    @classmethod
+    def setUpClass(cls):
+        repo = os.getenv("EKO_REPO_PATH", "/home/admin/eko-livekit")
+        if not os.path.isdir(os.path.join(repo, "eko", "hub")):
+            raise unittest.SkipTest("eko-livekit no presente (CI remoto)")
+
+    def setUp(self):
+        import importlib
+        importlib.reload(canonical_hub)
+        self.tmp = tempfile.mkdtemp(prefix="chub_follow_")
+        canonical_hub._HUB_DB = os.path.join(self.tmp, "hub.db")
+        self.addCleanup(setattr, canonical_hub, "_HUB_DB", None)
+        self.conv = canonical_hub.ensure_conversation(101, 202, "Voz Discord · follow", "ztest")
+        self.ep_id = "discord-voice:101:202"
+        schema = canonical_hub._load_hub()
+        conn = canonical_hub._connect(schema)
+        schema.append_event(conn, event_id="cf:1", canonical_conversation_id=self.conv,
+                            origin_endpoint_id="telegram:9:9", source_message_id=None,
+                            actor_type="human", content="hola desde telegram",
+                            created_at=time.time())
+        schema.append_event(conn, event_id="cf:2", canonical_conversation_id=self.conv,
+                            origin_endpoint_id=self.ep_id, source_message_id=None,
+                            actor_type="voice_agent", content="respuesta propia",
+                            created_at=time.time() + 1)
+        conn.close()
+
+    def test_context_block_ajenos_y_ack(self):
+        block, through = canonical_hub.voice_context_block(self.ep_id)
+        self.assertIn("hola desde telegram", block)
+        self.assertNotIn("respuesta propia", block)
+        self.assertEqual(through, 2)
+        self.assertEqual(canonical_hub.acknowledge_voice_context(self.ep_id, through), 2)
+        block2, through2 = canonical_hub.voice_context_block(self.ep_id)
+        self.assertEqual((block2, through2), ("", 0))
+
+    def test_context_block_solo_propios_devuelve_through(self):
+        canonical_hub.acknowledge_voice_context(self.ep_id, 1)
+        schema = canonical_hub._load_hub()
+        conn = canonical_hub._connect(schema)
+        schema.append_event(conn, event_id="cf:3", canonical_conversation_id=self.conv,
+                            origin_endpoint_id=self.ep_id, source_message_id=None,
+                            actor_type="voice_agent", content="otra propia",
+                            created_at=time.time() + 2)
+        conn.close()
+        block, through = canonical_hub.voice_context_block(self.ep_id)
+        self.assertEqual(block, "")
+        self.assertEqual(through, 3)  # el caller hace ACK sin inyectar
+
+    def test_seed_block_tail(self):
+        block, through = canonical_hub.voice_seed_block(self.ep_id)
+        self.assertIn("hola desde telegram", block)
+        self.assertNotIn("respuesta propia", block)
+        self.assertEqual(through, 2)
+
+    def test_fail_open_sin_endpoint(self):
+        self.assertEqual(canonical_hub.voice_context_block("noexiste"), ("", 0))
+        self.assertEqual(canonical_hub.voice_seed_block("noexiste"), ("", 0))
+        self.assertEqual(canonical_hub.acknowledge_voice_context("noexiste", 5), 0)
+
+
 if __name__ == "__main__":
     unittest.main()

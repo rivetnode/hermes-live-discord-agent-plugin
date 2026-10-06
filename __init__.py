@@ -627,6 +627,44 @@ def _infer_user_voice_channel(adapter, user_id: str) -> Optional[tuple]:
     return None
 
 
+async def _handle_voice_conv_command(content: str, guild: Any, info: Dict[str, Any]) -> None:
+    """Comandos /conv escritos en el chat de texto del canal de voz.
+
+    Se rutean al control plane de Eko (CLI) ANTES de Gemini; la respuesta va
+    al propio chat. Si el comando cambia de conversación (attach), se aplica
+    hot-swap al bridge vivo (misma sesión, sin reconectar).
+    """
+    try:
+        vc_channel = getattr(info.get("vc"), "channel", None)
+        cid = getattr(vc_channel, "id", None) if vc_channel is not None else None
+        if vc_channel is None or cid is None:
+            return
+        ep_id = f"discord-voice:{guild.id}:{cid}"
+        parts = content.split(maxsplit=2)
+        sub = parts[1].lower() if len(parts) > 1 else ""
+        # En el canal de VOZ, /conv use se trata como attach (suscripción sin
+        # dump de historial — el contexto llega por catch-up silencioso).
+        if sub == "use":
+            content = "/conv attach" + content[len("/conv use"):]
+            sub = "attach"
+        cp = getattr(_bridge_mod, "conv_control_plane", None) if _bridge_mod is not None else None
+        if cp is None:
+            await vc_channel.send("Control plane no disponible por ahora.")
+            return
+        res = await asyncio.to_thread(cp, content, ep_id)
+        text = str(res.get("text") or "Sin respuesta.")[:1900]
+        await vc_channel.send(text)
+        conv_id = str(res.get("conversation_id") or "")
+        if res.get("ok") and conv_id and sub == "attach":
+            bridge = getattr(_bridge_mod, "BRIDGE", None) if _bridge_mod is not None else None
+            gem = getattr(bridge, "_gemini", None) if bridge is not None else None
+            if gem is not None and getattr(bridge, "_guild_id", None) == guild.id:
+                gem.hub_apply_attach(conv_id)
+                logger.info("VoiceLive: hot-swap tras /conv attach → %s", conv_id)
+    except Exception:
+        logger.debug("VoiceLive: /conv command handling failed", exc_info=True)
+
+
 async def _on_voice_text_message(message: Any) -> None:
     """Forward a message typed in the voice channel's built-in text chat to the live session.
 
@@ -653,6 +691,10 @@ async def _on_voice_text_message(message: Any) -> None:
             return
         content = (getattr(message, "content", "") or "").strip()
         if not content:
+            return
+        if content.startswith("/conv"):
+            # conversation-follow: comandos de conversación en el chat de voz
+            await _handle_voice_conv_command(content, guild, info)
             return
         bridge = getattr(_bridge_mod, "BRIDGE", None) if _bridge_mod is not None else None
         gemini = getattr(bridge, "_gemini", None) if bridge is not None else None
