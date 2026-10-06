@@ -177,7 +177,11 @@ def invalidate_cache(slot: Optional[str] = None) -> None:
 # We track the most-recently-active source by weakref.
 
 _ACTIVE_SOURCES: Dict[str, Any] = {}  # session_id → (weakref to source, ts)
-_ACTIVE_LOCK = threading.Lock()
+# RLock (NO Lock) — 6-oct: el callback weakref de un source reemplazado puede
+# disparar DURANTE el reemplazo, mientras el mismo hilo ya tiene el lock: con
+# threading.Lock eso es autodeadlock (los tests lo destaparon; en producción
+# podía colgar un hilo del gateway). RLock permite la re-entrada.
+_ACTIVE_LOCK = threading.RLock()
 
 
 def register_active_source(session_id: str, source: Any) -> None:
@@ -190,8 +194,16 @@ def register_active_source(session_id: str, source: Any) -> None:
 
 
 def _forget(session_id: str) -> None:
+    """Callback weakref: limpia la entrada SOLO si ya está muerta.
+
+    6-oct: un pop a ciegas se llevaba una entrada NUEVA recién registrada
+    (el callback del source viejo dispara cuando el reemplazo ya instaló el
+    nuevo). Con el chequeo, solo limpia entradas realmente vacías.
+    """
     with _ACTIVE_LOCK:
-        _ACTIVE_SOURCES.pop(session_id, None)
+        cur = _ACTIVE_SOURCES.get(session_id)
+        if cur is not None and cur[0]() is None:
+            _ACTIVE_SOURCES.pop(session_id, None)
 
 
 def pick_active_source() -> Optional[Any]:

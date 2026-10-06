@@ -40,7 +40,7 @@ Owner authorization is only partially fail-closed on current `main`: historical 
 
 | Var | Default | Description |
 |---|---|---|
-| `GEMINI_AUDIO_STREAM_IDLE_END_SECONDS` | `0.25` | Time of audio silence before the model considers the user turn ended |
+| `GEMINI_AUDIO_STREAM_IDLE_END_SECONDS` | `1.0` | Time of audio silence before the model considers the user turn ended. Keep >=0.5s (Live API docs): lower values cut natural pauses and fragment transcription |
 | `DISCORD_VOICE_LIVE_OUTPUT_PREROLL_MS` | `320` | Pre-roll audio before first byte lands in Discord |
 | `DISCORD_VOICE_LIVE_OUTPUT_TAIL_PAD_MS` | `240` | Tail padding after last byte (prevents click on natural ends) |
 | `DISCORD_VOICE_LIVE_OUTPUT_FADE_IN_MS` | `0` | Fade-in applied to output chunks; disabled by default |

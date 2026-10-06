@@ -4317,7 +4317,10 @@ else:
 
 
 class GeminiLiveBridge:
-    AUDIO_STREAM_IDLE_END_SECONDS = float(os.getenv("GEMINI_AUDIO_STREAM_IDLE_END_SECONDS", "0.25"))
+    # 6-oct: 0.25s cortaba frases en pausas naturales (docs Live API: umbrales
+    # cliente de fin-de-voz deben ser >=500ms; con 0.25s el turno cerraba en
+    # micro-pausas y la transcripción se fragmentaba — p.ej. "Bueno, tío, que").
+    AUDIO_STREAM_IDLE_END_SECONDS = float(os.getenv("GEMINI_AUDIO_STREAM_IDLE_END_SECONDS", "1.0"))
 
     def __init__(
         self,
@@ -4666,8 +4669,11 @@ class GeminiLiveBridge:
                     "disabled": False,
                     "startOfSpeechSensitivity": "START_SENSITIVITY_LOW",
                     "endOfSpeechSensitivity": "END_SENSITIVITY_LOW",
-                    "prefixPaddingMs": 0,
-                    "silenceDurationMs": 40,
+                    # 6-oct: docs Live API — silenceDurationMs recomendado 500-800
+                    # (40 fragmentaba cada pausa natural en "cortes" de turno);
+                    # prefixPaddingMs 0 recorta inicios de palabra.
+                    "prefixPaddingMs": 200,
+                    "silenceDurationMs": 600,
                 }
             },
             # NOTE: top-level `voice_activity_detection` is intentionally
@@ -5859,6 +5865,24 @@ class VoiceLiveBridge:
         receiver = self._adapter._voice_receivers.get(self._guild_id)
         if receiver:
             receiver.resume()
+        # Resumen de sesión (6-oct): cortes por inactividad + salud decrypt DAVE
+        # + frames del sink. Best-effort, para diagnóstico de calidad de audio.
+        try:
+            try:
+                from discord.ext.voice_recv import opus as _vr_opus
+                _dave = dict(getattr(_vr_opus.PacketDecoder, "_hermes_dave_stats", {}) or {})
+            except Exception:
+                _dave = {}
+            _metrics = dict(getattr(self._gemini, "metrics", {}) or {})
+            _sink = self._listener.stats() if self._listener and hasattr(self._listener, "stats") else {}
+            logger.info(
+                "VoiceLive: session stats — stream_end_events=%s dave=%s sink=%s",
+                _metrics.get("audio_stream_end_events"),
+                {k: _dave.get(k) for k in ("decrypt_ok", "decrypt_exc", "nvc", "passthrough_exc", "decode_fail")},
+                _sink,
+            )
+        except Exception:
+            pass
         logger.info("VoiceLive bridge stopped")
 
     def health(self) -> Dict[str, Any]:
