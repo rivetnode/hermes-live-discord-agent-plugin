@@ -109,8 +109,14 @@ def provision_surfaces(conv_id: str, title: str, tenant_id: str = "t1") -> None:
             return
         conn = _connect(schema)
         try:
-            _provision_dedicated_topic(conn, conv_id, str(title)[:100], tenant_id)
-            logger.info("canonical_hub: surfaces provisionadas para %s", conv_id)
+            res = _provision_dedicated_topic(conn, conv_id, str(title)[:100], tenant_id)
+            if res:
+                logger.info("canonical_hub: surfaces provisionadas para %s", conv_id)
+            else:
+                logger.info(
+                    "canonical_hub: sin surfaces nuevas para %s (ya existían o falló best-effort)",
+                    conv_id,
+                )
         finally:
             conn.close()
     except Exception as exc:

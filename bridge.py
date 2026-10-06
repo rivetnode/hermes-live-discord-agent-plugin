@@ -4581,6 +4581,13 @@ class GeminiLiveBridge:
                 peer_override = None
         honcho_ctx = await _build_honcho_context(peer_name_override=peer_override)
         system_text = base_prompt + honcho_ctx
+        # Nombre del asistente (fix 6-oct): la transcripción del audio a veces
+        # convierte "Eko" en "eco/ECOA/Ecuador" — aclararlo reduce confusión.
+        system_text = system_text + (
+            "\n\nNota de contexto: el asistente se llama Eko («E-k-o»). Si la "
+            "transcripción del audio del usuario dice «eco», «ECOA» o «Ecuador» "
+            "refiriéndose a ti o a esta herramienta, es «Eko»."
+        )
         # #32: If this is a new user who hasn't been onboarded, append
         # a one-time system reminder to start the Q&A flow. The agent
         # sees this on the very first turn, calls
@@ -4982,24 +4989,31 @@ class GeminiLiveBridge:
                 pass
 
     async def _run_conv_tool(self, name: str, args: Dict[str, Any]) -> Dict[str, Any]:
-        """conv_find / conv_attach — pistas + retomar (conversation-follow)."""
+        """conv_find / conv_attach / conv_current — pistas + retomar."""
         linked = await asyncio.to_thread(self._hub_ensure)
         if not linked:
             return {"error": "Hub de conversaciones no disponible"}
         _conv, ep_id = linked
         args = args if isinstance(args, dict) else {}
+        if name == "conv_current":
+            res = await asyncio.to_thread(conv_control_plane, "/conv current", ep_id)
+            return {"result": res.get("text") or "No sé en qué conversación estoy."}
         if name == "conv_find":
+            # Sin pistas → el control plane devuelve las RECIENTES (6-oct).
             q = str(args.get("consulta") or "").strip()
-            if not q:
-                return {"error": "Dime qué palabras buscar"}
-            res = await asyncio.to_thread(conv_control_plane, f"/conv find {q}", ep_id)
-            return {"result": res.get("text") or "No encontré nada."}
+            cmd = f"/conv find {q}" if q else "/conv find"
+            res = await asyncio.to_thread(conv_control_plane, cmd, ep_id)
+            if res.get("ok"):
+                return {"result": res.get("text") or "Sin resultados."}
+            return {"error": res.get("text") or "No encontré nada."}
         ref = str(args.get("ref") or "").strip()
         if not ref:
-            return {"error": "Falta el número o nombre de la conversación"}
+            return {"error": "Falta el número, nombre o id de la conversación"}
         res = await asyncio.to_thread(conv_control_plane, f"/conv attach {ref}", ep_id)
-        if res.get("ok") and res.get("attached"):
-            self.hub_apply_attach(str(res.get("conversation_id") or ""))
+        if res.get("ok"):
+            # ok sin 'attached' = "Ya estás en «X»" — éxito, no error (6-oct).
+            if res.get("attached"):
+                self.hub_apply_attach(str(res.get("conversation_id") or ""))
             return {"result": res.get("text") or "Listo."}
         return {"error": res.get("text") or "No pude retomar esa conversación"}
 
@@ -5387,7 +5401,7 @@ class GeminiLiveBridge:
                             _run_opencode_tool_with_bridge,
                             name, args, _user_id, self,
                         )
-                    elif name in ("conv_find", "conv_attach"):
+                    elif name in ("conv_find", "conv_attach", "conv_current"):
                         result = await self._run_conv_tool(name, args)
                     elif name in self._mcp_tool_names:
                         result = await self._call_mcp_tool(name, args)
@@ -6224,7 +6238,8 @@ _CONV_FUNCTION_DECLARATIONS = [
         "description": (
             "Busca conversaciones de Hermes por pistas (tema, palabras, nombre) "
             "cuando el usuario quiera retomar o continuar algo que se habló antes. "
-            "Úsala también antes de conv_attach. Devuelve candidatos numerados."
+            "Úsala también antes de conv_attach. Devuelve candidatos numerados. "
+            "Si no das palabras, devuelve las conversaciones más recientes."
         ),
         "parameters": {
             "type": "object",
@@ -6242,8 +6257,10 @@ _CONV_FUNCTION_DECLARATIONS = [
         "description": (
             "Retoma una conversación encontrada con conv_find: la sesión actual "
             "se suscribe a ella y sigue ahí (lo que se diga se agrega a esa "
-            "conversación). Pasa el número del candidato (ej. '2') o un "
-            "fragmento único del nombre."
+            "conversación). Pasa el número del candidato (ej. '2'), un "
+            "fragmento único del nombre, el id de la conversación (conv:…) o "
+            "el id de una sesión (ej. 20260905_230907_abc123 o s:<id>). Si ya "
+            "estás en esa conversación, te dirá que ya estás ahí (eso es éxito)."
         ),
         "parameters": {
             "type": "object",
@@ -6255,6 +6272,15 @@ _CONV_FUNCTION_DECLARATIONS = [
             },
             "required": ["ref"],
         },
+    },
+    {
+        "name": "conv_current",
+        "description": (
+            "Dice en qué conversación está ahora esta sesión de voz (título y "
+            "canales enlazados). Úsala cuando el usuario pregunte dónde están "
+            "o dónde quedamos, o si dudas del estado antes de conv_attach."
+        ),
+        "parameters": {"type": "object", "properties": {}, "required": []},
     },
 ]
 
