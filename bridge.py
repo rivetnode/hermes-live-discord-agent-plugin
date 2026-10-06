@@ -106,6 +106,9 @@ GEMINI_MODEL_FALLBACKS = [
     if model.strip()
 ]
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "") or os.getenv("GOOGLE_API_KEY", "")
+# 6-oct: si =1, el sink manda TODO el audio del usuario (sin puerta de energía).
+# A/B de calidad de transcripción: la puerta recorta fonemas suaves a media palabra.
+GEMINI_SINK_FORWARD_QUIET = os.getenv("GEMINI_SINK_FORWARD_QUIET", "0") == "1"
 GEMINI_VOICE_NAME = os.getenv("DISCORD_VOICE_LIVE_VOICE", "Kore")
 
 # ── cross-channel-voice-settings (5-oct-2026): store compartido ───────────
@@ -4296,7 +4299,7 @@ if voice_recv is not None:
             if not pcm:
                 return
             self._frames += 1
-            if not _has_speech_energy(pcm):
+            if not GEMINI_SINK_FORWARD_QUIET and not _has_speech_energy(pcm):
                 return
             self._decoded_frames += 1
             self._on_pcm(downsample_for_gemini(bytes(pcm)))
@@ -4685,8 +4688,15 @@ class GeminiLiveBridge:
             # servers, returning 1007). VAD tuning lives in the inner block
             # above. Same omission-rationale pattern as mediaResolution
             # at line 4322-4334.
-            "inputAudioTranscription": {},
+            "inputAudioTranscription": {
+                # 6-oct: sesgo de reconocimiento para nombres propios (docs Live API:
+                # custom_vocabulary) — "Eko" salía como "eco"/"Ecuador" en la voz.
+                "customVocabulary": ["Eko", "Ekö", "Zono", "Celora", "Hermes"],
+            },
             "outputAudioTranscription": {},
+            # 6-oct (docs best practices): sin esto, las sesiones de audio se cortan
+            # a los ~15 min; el sliding window las hace de duración ilimitada.
+            "contextWindowCompression": {"slidingWindow": {}},
             "systemInstruction": {
                 "parts": [{
                     "text": system_text
@@ -5867,22 +5877,25 @@ class VoiceLiveBridge:
             receiver.resume()
         # Resumen de sesión (6-oct): cortes por inactividad + salud decrypt DAVE
         # + frames del sink. Best-effort, para diagnóstico de calidad de audio.
-        try:
+        # Guard: stop() puede llamarse más de una vez (doble log visto 6-oct).
+        if not getattr(self, "_session_stats_logged", False):
+            self._session_stats_logged = True
             try:
-                from discord.ext.voice_recv import opus as _vr_opus
-                _dave = dict(getattr(_vr_opus.PacketDecoder, "_hermes_dave_stats", {}) or {})
+                try:
+                    from discord.ext.voice_recv import opus as _vr_opus
+                    _dave = dict(getattr(_vr_opus.PacketDecoder, "_hermes_dave_stats", {}) or {})
+                except Exception:
+                    _dave = {}
+                _metrics = dict(getattr(self._gemini, "metrics", {}) or {})
+                _sink = self._listener.stats() if self._listener and hasattr(self._listener, "stats") else {}
+                logger.info(
+                    "VoiceLive: session stats — stream_end_events=%s dave=%s sink=%s",
+                    _metrics.get("audio_stream_end_events"),
+                    {k: _dave.get(k) for k in ("decrypt_ok", "decrypt_exc", "nvc", "passthrough_exc", "decode_fail")},
+                    _sink,
+                )
             except Exception:
-                _dave = {}
-            _metrics = dict(getattr(self._gemini, "metrics", {}) or {})
-            _sink = self._listener.stats() if self._listener and hasattr(self._listener, "stats") else {}
-            logger.info(
-                "VoiceLive: session stats — stream_end_events=%s dave=%s sink=%s",
-                _metrics.get("audio_stream_end_events"),
-                {k: _dave.get(k) for k in ("decrypt_ok", "decrypt_exc", "nvc", "passthrough_exc", "decode_fail")},
-                _sink,
-            )
-        except Exception:
-            pass
+                pass
         logger.info("VoiceLive bridge stopped")
 
     def health(self) -> Dict[str, Any]:
