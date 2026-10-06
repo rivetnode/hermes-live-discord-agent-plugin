@@ -261,6 +261,8 @@ MCP_VOICE_TOOLS_ENABLED = os.getenv(
 ).lower() in {"1", "true", "yes", "on"}
 MCP_URL = os.getenv("DISCORD_VOICE_MCP_URL", "http://127.0.0.1:9999/mcp")
 MCP_TOKEN = os.getenv("DISCORD_VOICE_MCP_TOKEN", "")
+# Tope de tamaño de un resultado MCP hacia la sesión de voz (frames WS).
+MCP_RESULT_MAX_CHARS = int(os.getenv("DISCORD_VOICE_MCP_RESULT_MAX_CHARS", "120000"))
 HUB_VOICE_ENABLED = os.getenv(
     "DISCORD_VOICE_LIVE_HUB", "true"
 ).lower() in {"1", "true", "yes", "on"}
@@ -4558,7 +4560,9 @@ class GeminiLiveBridge:
             asyncio.create_task(self._hub_context_loop()),
         ]
         if INITIAL_GREETING and not self._reconnecting:
-            await self.send_text(INITIAL_GREETING)
+            # journal=False: el saludo es sintético (no lo dijo el humano) —
+            # no debe entrar al journal del Hub ni espejarse a otros canales.
+            await self.send_text(INITIAL_GREETING, journal=False)
 
     async def _connect_model(self, websockets, ws_url: str, model: str, handle=None):
         self._ws = await websockets.connect(ws_url, ping_interval=20, ping_timeout=10)
@@ -4772,12 +4776,13 @@ class GeminiLiveBridge:
                 return
         raise RuntimeError(f"Gemini setup ended before setupComplete for {model}")
 
-    async def send_text(self, text: str) -> None:
+    async def send_text(self, text: str, journal: bool = True) -> None:
         if not self._ws or not text.strip():
             return
         msg = {"realtimeInput": {"text": text.strip()}}
         await self._ws.send(json.dumps(msg))
-        self._hub_note("input", text.strip())
+        if journal:
+            self._hub_note("input", text.strip())
 
     # ── Fase 5 (parte 2): puente al Hub de conversaciones canónicas ──────
 
@@ -4799,12 +4804,16 @@ class GeminiLiveBridge:
         try:
             if not HUB_VOICE_ENABLED or _hub_append_turns is None:
                 return
-            inp = [t for t in self._hub_in_buf if t.strip()]
-            out = [t for t in self._hub_out_buf if t.strip()]
+            inp_raw = [t for t in self._hub_in_buf if t.strip()]
+            out_raw = [t for t in self._hub_out_buf if t.strip()]
             self._hub_in_buf.clear()
             self._hub_out_buf.clear()
-            if not inp and not out:
+            if not inp_raw and not out_raw:
                 return
+            # Los transcripts llegan en chunks: un turno = UN evento por
+            # dirección (unir con espacio y colapsar espacios repetidos).
+            inp = [" ".join(" ".join(inp_raw).split())] if inp_raw else []
+            out = [" ".join(" ".join(out_raw).split())] if out_raw else []
             loop = asyncio.get_running_loop()
             loop.create_task(self._hub_send_turn(inp, out))
         except Exception as exc:
@@ -5215,6 +5224,9 @@ class GeminiLiveBridge:
         self.metrics[f"last_{metric_prefix}"] = text[-500:]
         logger.info("Gemini %s transcript: %s", direction, text)
         self._append_note_event(direction, text)
+        # Al Hub: alimenta el journal de la conversación (la voz hablada
+        # también se guarda y se espeja a los demás canales).
+        self._hub_note(direction, text)
         # Webhook: push transcript line to voice.transcript webhooks
         try:
             from webhook_dispatcher import emit_voice_input, emit_voice_output
@@ -5281,6 +5293,10 @@ class GeminiLiveBridge:
             if prefixed_name.startswith(MCP_TOOL_PREFIX)
             else prefixed_name
         )
+        if real == "get_session_messages" and isinstance(args, dict):
+            # En voz SIEMPRE modo conversacional: "completo" devuelve
+            # payloads técnicos de cientos de KB que barren la sesión.
+            args = {**args, "modo": "conversacional"}
         client = self._mcp_client
         if client is None:
             client = HermesMCPClient(MCP_URL, MCP_TOKEN or None)
@@ -5288,6 +5304,11 @@ class GeminiLiveBridge:
         text = await client.call_tool(real, args if isinstance(args, dict) else {})
         if text is None:
             return {"error": f"sin respuesta del MCP de Hermes para {real}"}
+        if len(text) > MCP_RESULT_MAX_CHARS:
+            text = (
+                text[:MCP_RESULT_MAX_CHARS]
+                + "\n\n[Nota: resultado truncado por tamaño — pide una ventana más corta si falta algo.]"
+            )
         return {"result": text}
 
     async def _handle_tool_call(self, tool_call: Any) -> None:
