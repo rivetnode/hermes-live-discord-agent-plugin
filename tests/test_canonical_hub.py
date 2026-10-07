@@ -221,6 +221,40 @@ class TestConversationFollow(unittest.TestCase):
         self.assertNotIn("respuesta propia", block)
         self.assertEqual(through, 2)
 
+    def test_seed_fallback_state_db(self):
+        # Fix 7-oct: conv retomada (ancla) sin eventos ajenos → seed de state.db.
+        schema = canonical_hub._load_hub()
+        conn = canonical_hub._connect(schema)
+        conv2 = schema.create_conversation(conn, tenant_id="ztest", title="Retomada")
+        schema.upsert_endpoint(
+            conn, endpoint_id="discord-voice:303:404",
+            canonical_conversation_id=conv2, channel="discord",
+            metadata={"anchor_session_id": "sid_ret"}, tenant_id="ztest",
+        )
+        conn.commit()
+        conn.close()
+        sdb = os.path.join(self.tmp, "state.db")
+        c = sqlite3.connect(sdb)
+        c.execute(
+            "CREATE TABLE messages (id INTEGER PRIMARY KEY, session_id TEXT, "
+            "role TEXT, content TEXT, timestamp REAL)"
+        )
+        c.execute("INSERT INTO messages (session_id, role, content, timestamp) "
+                  "VALUES ('sid_ret', 'user', 'hola viejo', 1.0)")
+        c.execute("INSERT INTO messages (session_id, role, content, timestamp) "
+                  "VALUES ('sid_ret', 'assistant', 'respuesta vieja', 2.0)")
+        c.commit()
+        c.close()
+        orig = canonical_hub._STATE_DBS
+        canonical_hub._STATE_DBS = (sdb,)
+        try:
+            block, through = canonical_hub.voice_seed_block("discord-voice:303:404")
+            self.assertIn("hola viejo", block)
+            self.assertIn("respuesta vieja", block)
+            self.assertNotIn("respuesta propia", block)
+        finally:
+            canonical_hub._STATE_DBS = orig
+
     def test_fail_open_sin_endpoint(self):
         self.assertEqual(canonical_hub.voice_context_block("noexiste"), ("", 0))
         self.assertEqual(canonical_hub.voice_seed_block("noexiste"), ("", 0))

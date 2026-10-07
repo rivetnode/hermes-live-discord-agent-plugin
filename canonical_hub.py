@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import logging
 import os
+import sqlite3
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -25,6 +26,12 @@ logger = logging.getLogger(__name__)
 _REPO = os.getenv("EKO_REPO_PATH", "/home/admin/eko-livekit")
 # Override para tests (None = default del repo: EKO_HUB_DB o ~/.eko/hub.db).
 _HUB_DB: Optional[str] = os.getenv("DISCORD_VOICE_HUB_DB") or None
+
+# state.db de Hermes para el seed de sesiones RETOMADAS (fix 7-oct).
+_STATE_DBS = (
+    os.path.expanduser("~/.hermes/state.db"),
+    os.path.expanduser("~/.hermes-worker/state.db"),
+)
 
 
 def _load_hub():
@@ -249,6 +256,56 @@ def voice_context_block(endpoint_id: str):
         return ("", 0)
 
 
+_SEED_STATE_EVENTS = 14
+
+
+def _seed_from_state_db(session_id: str, title: str = "") -> str:
+    """Bloque de contexto desde state.db para sesiones RETOMADAS (fix 7-oct).
+
+    Una conv revivida/ancla no tiene eventos ajenos en el Hub todavía; el
+    contexto real de la sesión vive en state.db. Fail-open → "".
+    """
+    if not session_id:
+        return ""
+    for db_path in _STATE_DBS:
+        if not os.path.exists(db_path):
+            continue
+        try:
+            conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=4)
+            try:
+                rows = conn.execute(
+                    "SELECT role, content, timestamp FROM messages "
+                    "WHERE session_id = ? AND role IN ('user', 'assistant') "
+                    "AND content IS NOT NULL AND content != '' "
+                    "ORDER BY id DESC LIMIT ?",
+                    (str(session_id), _SEED_STATE_EVENTS),
+                ).fetchall()
+            finally:
+                conn.close()
+        except Exception:
+            continue
+        if not rows:
+            continue
+        lines = []
+        for role, content, ts in reversed(rows):
+            try:
+                when = time.strftime("%d/%m %H:%M", time.localtime(float(ts or 0)))
+            except Exception:
+                when = "?"
+            who = "Darío" if str(role) == "user" else "Eko"
+            text = " ".join(str(content).split())[:400]
+            lines.append(f"[{when}] {who}: {text}")
+        head = "Contexto de la conversación retomada"
+        if title:
+            head += f" «{title}»"
+        head += " (últimos mensajes):"
+        block = head + "\n" + "\n".join(lines)
+        if len(block) > _CTX_MAX_CHARS:
+            block = "…(contexto recortado)…\n" + block[-_CTX_MAX_CHARS:]
+        return block
+    return ""
+
+
 def voice_seed_block(endpoint_id: str):
     """Tail reciente de la conv actual — para SEMBRAR al retomar (attach).
 
@@ -266,6 +323,18 @@ def voice_seed_block(endpoint_id: str):
             if not ep:
                 return ("", 0)
             conv = ep["canonical_conversation_id"]
+            anchor_sid = str((ep.get("metadata") or {}).get("anchor_session_id") or "")
+
+            def _state_db_seed() -> str:
+                # Fix 7-oct: sesión retomada sin eventos ajenos → seed de state.db.
+                if not anchor_sid:
+                    return ""
+                trow = conn.execute(
+                    "SELECT COALESCE(title, '') FROM canonical_conversations WHERE id = ?",
+                    (conv,),
+                ).fetchone()
+                return _seed_from_state_db(anchor_sid, str(trow[0]) if trow else "")
+
             row = conn.execute(
                 "SELECT COALESCE(MAX(canonical_seq), 0) FROM canonical_events "
                 "WHERE canonical_conversation_id = ?",
@@ -273,7 +342,8 @@ def voice_seed_block(endpoint_id: str):
             ).fetchone()
             max_seq = int(row[0]) if row and row[0] else 0
             if max_seq <= 0:
-                return ("", 0)
+                block = _state_db_seed()
+                return (_trim_block(block), 0) if block else ("", 0)
             after = max(0, max_seq - _SEED_EVENTS)
             events = schema.events_for_conversation(
                 conn, conv, after_seq=after, limit=_SEED_EVENTS + 1
@@ -284,7 +354,8 @@ def voice_seed_block(endpoint_id: str):
                 and (ev.get("content") or "").strip()
             ]
             if not foreign:
-                return ("", max_seq)
+                block = _state_db_seed()
+                return (_trim_block(block), max_seq) if block else ("", max_seq)
             return (_trim_block(schema.render_context_block(foreign, max_events=_SEED_EVENTS)), max_seq)
         finally:
             conn.close()
