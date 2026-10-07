@@ -5934,6 +5934,29 @@ HTTP_PORT = int(os.getenv("DISCORD_VOICE_LIVE_PORT", "18943"))
 BRIDGE: Optional[VoiceLiveBridge] = None
 
 
+def _resolve_control_secret_mod():
+    """Return the loaded plugin module that exposes CONTROL_API_SECRET.
+
+    The Hermes plugin loader imports directory plugins as
+    ``hermes_plugins.<slug>`` (e.g. ``hermes_plugins.discord_voice``); the
+    legacy spec names stay as fallbacks for stand-alone imports and tests.
+    """
+    for name in (
+        "hermes_plugins.discord_voice",
+        "discord_voice_live",
+        "discord_voice_live_bridge",
+    ):
+        mod = sys.modules.get(name)
+        if getattr(mod, "CONTROL_API_SECRET", ""):
+            return mod
+    # Last resort: any loaded module that carries the secret (covers
+    # ``hermes_plugins.discord_voice__home_<digest>`` style names).
+    for name, mod in list(sys.modules.items()):
+        if "discord_voice" in name and getattr(mod, "CONTROL_API_SECRET", ""):
+            return mod
+    return None
+
+
 async def handle_http_request(reader, writer):
     request_data = b""
     while True:
@@ -5973,22 +5996,19 @@ async def handle_http_request(reader, writer):
     # spec we shared there.
     MUTATING_ROUTES = {"/stop", "/say", "/frame", "/notify"}
     if route in MUTATING_ROUTES:
-        # Look up the plugin's __init__ module via sys.modules under its real
-        # import name (discord_voice_live, set when the plugin loader imports
-        # this package). `from __init__ import` is fragile and fails when
-        # bridge.py is loaded as a stand-alone spec.
-        import sys as _sys
-        _plugin_mod = _sys.modules.get("discord_voice_live")
-        if _plugin_mod is None:
-            # Fall back to the spec name used by _bridge_mod if the parent
-            # package isn't installed under the conventional name.
-            _plugin_mod = _sys.modules.get("discord_voice_live_bridge")
+        # Look up the plugin's __init__ module via sys.modules. The Hermes
+        # plugin loader imports directory plugins as "hermes_plugins.<slug>"
+        # (e.g. hermes_plugins.discord_voice); legacy spec names stay as
+        # fallbacks for stand-alone imports and tests.
+        _plugin_mod = _resolve_control_secret_mod()
         if _plugin_mod is None:
             status = 500
             response_body = json.dumps({"error": "control secret unavailable"})
             response = _format_response(status, response_body, reason="INTERNAL")
             writer.write(response)
             await writer.drain()
+            # Close so HTTP clients see EOF instead of hanging on read().
+            writer.close()
             return
         _SECRET = getattr(_plugin_mod, "CONTROL_API_SECRET", "")
         if not _SECRET:
@@ -5997,6 +6017,8 @@ async def handle_http_request(reader, writer):
             response = _format_response(status, response_body, reason="INTERNAL")
             writer.write(response)
             await writer.drain()
+            # Close so HTTP clients see EOF instead of hanging on read().
+            writer.close()
             return
         presented = headers.get("x-api-secret", "")
         # Constant-time compare to avoid timing leaks.
@@ -6006,6 +6028,8 @@ async def handle_http_request(reader, writer):
             response = _format_response(status, response_body, reason="UNAUTHORIZED")
             writer.write(response)
             await writer.drain()
+            # Close so HTTP clients see EOF instead of hanging on read().
+            writer.close()
             return
     if route == "/health":
         response_body = json.dumps(BRIDGE.health() if BRIDGE else {"status": "not_started", "running": False})

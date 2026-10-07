@@ -584,6 +584,7 @@ async def _control_post_frame(data: bytes, mime: str, force: bool = False, query
             f"Host: 127.0.0.1\r\n"
             f"Content-Type: {mime}\r\n"
             f"Content-Length: {len(data)}\r\n"
+            f"x-api-secret: {CONTROL_API_SECRET}\r\n"
             f"Connection: close\r\n\r\n"
         )
         writer.write(headers.encode("utf-8") + data)
